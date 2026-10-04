@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: geocam-verification
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --workers 2 --timeout 90 app:app
+    envVars:
+      - key: GEOCAM_DATA_DIR
+        value: /persistent/geocam-data
+      - key: GEOCAM_DB
+        value: /persistent/geocam-data/records.sqlite3
+      - key: MAX_UPLOAD_MB
+        value: "80"
