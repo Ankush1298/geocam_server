@@ -6,12 +6,15 @@ RemoteStore - Postgres (records) + S3-compatible bucket (media). Survives
               restarts. Works with Supabase/Neon + Cloudflare R2/Supabase Storage/B2.
 """
 import hashlib
+import logging
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import redirect, send_file
+
+log = logging.getLogger("geocam.storage")
 
 COLUMNS = (
     "id", "protocol_version", "timestamp", "latitude", "longitude", "accuracy",
@@ -124,7 +127,11 @@ class RemoteStore:
             aws_access_key_id=access_key, aws_secret_access_key=secret_key,
             region_name=region,
             config=Config(signature_version="s3v4", s3={"addressing_style": "path"},
-                          retries={"max_attempts": 3}),
+                          retries={"max_attempts": 3},
+                          # Newer boto3 adds CRC32 checksum trailers that many S3-compatible
+                          # services (Supabase, R2, B2) reject. Only send them when required.
+                          request_checksum_calculation="when_required",
+                          response_checksum_validation="when_required"),
         )
         with self._connect() as conn:
             conn.execute("""CREATE TABLE IF NOT EXISTS records (
@@ -150,8 +157,15 @@ class RemoteStore:
 
     def put(self, rec, raw):
         # Media first, so a record never points at media that does not exist.
-        self.s3.put_object(Bucket=self.bucket, Key=self._key(rec["id"], rec["mediaType"]),
-                           Body=raw, ContentType=_mime(rec["mediaType"]))
+        from botocore.exceptions import ClientError
+        try:
+            self.s3.put_object(Bucket=self.bucket, Key=self._key(rec["id"], rec["mediaType"]),
+                               Body=raw, ContentType=_mime(rec["mediaType"]))
+        except ClientError as e:
+            meta = e.response.get("ResponseMetadata", {})
+            log.error("S3 upload failed: http=%s error=%s headers=%s", meta.get("HTTPStatusCode"),
+                      e.response.get("Error"), meta.get("HTTPHeaders"))
+            raise
         with self._connect() as conn:
             cur = conn.execute(
                 f"INSERT INTO records ({', '.join(COLUMNS)}) VALUES ({', '.join(['%s'] * len(COLUMNS))}) "
