@@ -3,22 +3,47 @@ import hashlib
 import json
 import os
 import re
-import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from flask import Flask, abort, jsonify, render_template_string, request, send_file
+from flask import Flask, abort, jsonify, render_template_string, request
+
+from storage import LocalStore, RemoteStore
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_UPLOAD_MB", "80")) * 1024 * 1024
 
-DATA_DIR = Path(os.environ.get("GEOCAM_DATA_DIR", "./data"))
-MEDIA_DIR = DATA_DIR / "media"
-DB_PATH = Path(os.environ.get("GEOCAM_DB", str(DATA_DIR / "records.sqlite3")))
-MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,119}$")
+
+
+def build_store():
+    remote_vars = {
+        "DATABASE_URL": os.environ.get("DATABASE_URL"),
+        "S3_BUCKET": os.environ.get("S3_BUCKET"),
+        "S3_ACCESS_KEY_ID": os.environ.get("S3_ACCESS_KEY_ID"),
+        "S3_SECRET_ACCESS_KEY": os.environ.get("S3_SECRET_ACCESS_KEY"),
+    }
+    if any(remote_vars.values()):
+        missing = [k for k, v in remote_vars.items() if not v]
+        if missing:
+            # Never silently fall back to a disk that Render wipes.
+            raise RuntimeError("Persistent storage is partly configured; missing: " + ", ".join(missing))
+        return RemoteStore(
+            remote_vars["DATABASE_URL"], remote_vars["S3_BUCKET"],
+            os.environ.get("S3_ENDPOINT_URL"), remote_vars["S3_ACCESS_KEY_ID"],
+            remote_vars["S3_SECRET_ACCESS_KEY"], os.environ.get("S3_REGION", "auto"),
+        )
+    data_dir = os.environ.get("GEOCAM_DATA_DIR", "./data")
+    store = LocalStore(data_dir, os.environ.get("GEOCAM_DB", str(Path(data_dir) / "records.sqlite3")))
+    if os.environ.get("RENDER"):
+        app.logger.warning("Using LOCAL disk on Render: records WILL be lost on restart. "
+                           "Set DATABASE_URL and S3_* variables.")
+    return store
+
+
+store = build_store()
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 TRUSTED_PUBLIC_KEYS = {x.strip() for x in os.environ.get("GEOCAM_TRUSTED_PUBLIC_KEYS", "").split(",") if x.strip()}
@@ -51,33 +76,6 @@ h2{margin:0 0 6px}.muted{color:#666;font-size:13px}.valid{background:#e8f5e9;bor
 <a class="btn" href="/{{ result.id }}/media">Open original verified media</a>
 {% endif %}</div></body></html>
 """
-
-
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    with db() as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS records (
-            id TEXT PRIMARY KEY,
-            protocol_version INTEGER NOT NULL,
-            timestamp TEXT NOT NULL,
-            latitude REAL,
-            longitude REAL,
-            accuracy REAL,
-            altitude REAL,
-            address TEXT NOT NULL,
-            media_type TEXT NOT NULL,
-            signature TEXT NOT NULL,
-            media_sha256 TEXT NOT NULL,
-            public_key TEXT NOT NULL,
-            media_path TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )""")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_records_public_key ON records(public_key)")
 
 
 def rv(record, camel, snake=None):
@@ -117,7 +115,7 @@ def validate_record(r):
         raise ValueError("Missing fields: " + ", ".join(missing))
     if r.get("protocolVersion") != 2:
         raise ValueError("Unsupported protocol version")
-    if not isinstance(r["id"], str) or not (3 <= len(r["id"]) <= 120):
+    if not isinstance(r["id"], str) or not ID_RE.fullmatch(r["id"]):
         raise ValueError("Invalid record id")
     if r["mediaType"] not in ("photo", "video"):
         raise ValueError("Invalid media type")
@@ -160,11 +158,7 @@ def row_to_result(row):
     result["mediaType"] = result.pop("media_type")
     result["mediaSha256"] = result.pop("media_sha256")
     result["publicKey"] = result.pop("public_key")
-    result["mediaPath"] = result.pop("media_path")
     return result
-
-
-init_db()
 
 
 @app.get("/")
@@ -196,25 +190,14 @@ def sync_record():
         if not verify_signature(record):
             return jsonify(error="Ed25519 signature is invalid"), 400
 
-        extension = "mp4" if record["mediaType"] == "video" else "jpg"
-        media_path = MEDIA_DIR / f"{record['id']}.{extension}"
-        with db() as conn:
-            existing = conn.execute("SELECT * FROM records WHERE id=?", (record["id"],)).fetchone()
-            if existing:
-                if existing["signature"] != record["signature"] or existing["media_sha256"] != record["mediaSha256"]:
-                    return jsonify(error="Record ID already exists with different cryptographic content"), 409
+        existing = store.get_record(record["id"])
+        if existing:
+            if existing["signature"] != record["signature"] or existing["media_sha256"] != record["mediaSha256"]:
+                return jsonify(error="Record ID already exists with different cryptographic content"), 409
+            if store.media_exists(existing):
                 return jsonify(success=True, id=record["id"], alreadyExists=True)
-            tmp = media_path.with_suffix(media_path.suffix + ".tmp")
-            tmp.write_bytes(raw)
-            tmp.replace(media_path)
-            conn.execute("""INSERT INTO records
-                (id, protocol_version, timestamp, latitude, longitude, accuracy, altitude, address,
-                 media_type, signature, media_sha256, public_key, media_path, created_at)
-                VALUES (?,2,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (record["id"], record["timestamp"], record.get("latitude"), record.get("longitude"),
-                 record.get("accuracy"), record.get("altitude"), record.get("address", ""),
-                 record["mediaType"], record["signature"], record["mediaSha256"], record["publicKey"],
-                 str(media_path), datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")))
+            # Record present but media lost: heal it by re-storing the (hash-verified) upload.
+        store.put(record, raw)
         return jsonify(success=True, id=record["id"], verified=True)
     except ValueError as e:
         return jsonify(error=str(e)), 400
@@ -223,28 +206,30 @@ def sync_record():
         return jsonify(error="Server error while storing record"), 500
 
 
+@app.get("/healthz")
+def healthz():
+    return jsonify(ok=True, storage=store.kind)
+
+
 @app.get("/<record_id>")
 def verify_record(record_id):
-    with db() as conn:
-        row = conn.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+    row = store.get_record(record_id)
     if not row:
-        return render_template_string(HTML, record_id=record_id, error="Record not found. The phone may not have synchronized it yet.")
-    if not Path(row["media_path"]).exists():
+        return render_template_string(HTML, record_id=record_id, error="No record with this ID exists on the server. It was either never synchronized from the phone, or the server lost it.")
+    actual = store.media_sha256(row)
+    if actual is None:
         return render_template_string(HTML, record_id=record_id, error="The verified record exists, but its media file is unavailable on the server.")
-    raw = Path(row["media_path"]).read_bytes()
-    media_ok = hashlib.sha256(raw).hexdigest() == row["media_sha256"]
-    sig_ok = verify_signature(row)
-    if not (media_ok and sig_ok):
+    if not (actual == row["media_sha256"] and verify_signature(row)):
         return render_template_string(HTML, record_id=record_id, error="The stored media or signed metadata failed cryptographic verification.")
     return render_template_string(HTML, record_id=record_id, result=row_to_result(row))
 
 
 @app.get("/<record_id>/media")
 def media(record_id):
-    with db() as conn:
-        row = conn.execute("SELECT media_path FROM records WHERE id=?", (record_id,)).fetchone()
-    if not row or not Path(row["media_path"]).exists(): abort(404)
-    return send_file(row["media_path"], conditional=True)
+    row = store.get_record(record_id)
+    if not row or not store.media_exists(row):
+        abort(404)
+    return store.serve_media(row)
 
 
 @app.errorhandler(413)

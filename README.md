@@ -22,25 +22,35 @@ The server therefore does **not** need, and must never contain, a GeoCam private
 ## Files
 
 - `app.py` — Flask verification API and browser verification page
+- `storage.py` — local and remote (Postgres + bucket) storage backends
 - `requirements.txt` — Python dependencies
 - `Procfile` — Gunicorn/Render startup command
 - `tests/test_server_protocol.py` — protocol tests
 
 Do **not** restore the old `records.json` database. v0.7 stores records in SQLite and media files in the configured data directory.
 
-## Render deployment
+## Render deployment (free plan)
 
-Create a Python web service and use the included `Procfile`.
+Render's free plan has **no persistent disk**: the local filesystem is wiped on every spin-down (15 min idle) and redeploy, which deletes SQLite records and uploaded media. So the server stores data externally:
 
-Recommended environment variables:
+- **Records** -> Postgres (`DATABASE_URL`) - Supabase or Neon free tier
+- **Media** -> S3-compatible bucket (`S3_*`) - Cloudflare R2, Supabase Storage (S3 endpoint) or Backblaze B2
 
 ```text
-GEOCAM_DATA_DIR=/persistent/geocam-data
-GEOCAM_DB=/persistent/geocam-data/records.sqlite3
+DATABASE_URL=postgresql://...            # use sslmode=require
+S3_ENDPOINT_URL=https://<account>.r2.cloudflarestorage.com
+S3_BUCKET=geocam-media
+S3_ACCESS_KEY_ID=...
+S3_SECRET_ACCESS_KEY=...
+S3_REGION=auto
 MAX_UPLOAD_MB=80
 ```
 
-A persistent disk is strongly recommended. Without persistent storage, SQLite records and uploaded media can disappear when the service is recreated.
+Open `https://YOUR-SERVER/healthz` after deploy: it must say `"storage":"remote"`. If it says `"local"`, records will still be lost on restart. If only some of the variables are set, the server refuses to start instead of silently using the disk.
+
+Without these variables the server uses local SQLite + disk (`GEOCAM_DATA_DIR`, `GEOCAM_DB`), which is fine for local development only.
+
+The first request after 15 idle minutes is still slow on the free plan (cold start). Data is no longer lost.
 
 Optional device enrollment:
 

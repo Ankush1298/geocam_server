@@ -69,3 +69,22 @@ def test_sync_and_web_verification_page():
     assert web_resp.status_code == 200
     assert b"MEDIA + SIGNATURE VERIFIED" in web_resp.data
 
+
+
+def test_rejects_path_traversal_record_id():
+    record = make_record(b'x')
+    record['id'] = '../../evil'
+    private_payload = b'x'
+    client = app.app.test_client()
+    resp = client.post('/sync', data={
+        'record': json.dumps(record),
+        'media': (io.BytesIO(private_payload), 'evil.jpg'),
+    }, content_type='multipart/form-data')
+    assert resp.status_code == 400
+
+
+def test_missing_record_message_and_healthz():
+    client = app.app.test_client()
+    resp = client.get('/GC-DOES-NOT-EXIST')
+    assert b'VERIFICATION FAILED' in resp.data
+    assert client.get('/healthz').get_json()['storage'] == 'local'
